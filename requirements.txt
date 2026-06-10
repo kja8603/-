@@ -1,0 +1,13 @@
+# 카드뉴스 자동화 파이프라인 의존성
+
+# 이미지 생성
+Pillow>=10.0.0
+
+# 트렌드 수집
+pytrends>=4.9.2
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# 환경변수
+python-dotenv>=1.0.0
