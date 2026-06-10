@@ -18,12 +18,14 @@ IMAGE_QUALITY = 95  # JPEG 품질
 
 # ── 폰트 경로 (시스템 한글 폰트 자동 탐지) ────────────────
 KOREAN_FONT_PATHS = [
+    "/usr/share/fonts/truetype/nanum/NanumSquareRoundB.ttf",   # 둥글고 모던한 느낌
+    "/usr/share/fonts/truetype/nanum/NanumSquareB.ttf",
     "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
+    "/usr/share/fonts/truetype/nanum/NanumBarunGothicBold.ttf",
+    "/usr/share/fonts/truetype/nanum/NanumSquareRoundR.ttf",
+    "/usr/share/fonts/truetype/nanum/NanumSquareR.ttf",
     "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
-    "/usr/share/fonts/nanum/NanumGothicBold.ttf",
-    "/usr/share/fonts/nanum/NanumGothic.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf",
     str(FONT_DIR / "NanumGothicBold.ttf"),
     str(FONT_DIR / "NanumGothic.ttf"),
 ]
