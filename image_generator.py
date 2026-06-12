@@ -1,279 +1,367 @@
-# image_generator.py - Pillow 기반 카드뉴스 이미지 생성
+# image_generator.py - 멀티슬라이드 카드뉴스 이미지 생성
 
+import io
 import logging
+import re
 import textwrap
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
 
+import requests
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 from config import (
-    IMAGE_WIDTH, IMAGE_HEIGHT, IMAGE_QUALITY,
+    IMAGE_WIDTH, IMAGE_HEIGHT, IMAGE_FORMAT,
     OUTPUT_DIR, KOREAN_FONT_PATHS, COLOR_PALETTES,
 )
-from content_generator import CardContent
+from content_generator import CardContent, CardSlide
 
 logger = logging.getLogger(__name__)
+
+W, H = IMAGE_WIDTH, IMAGE_HEIGHT
+MARGIN = 60
+INNER_W = W - MARGIN * 2
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+}
 
 
 # ── 폰트 로딩 ─────────────────────────────────────────────
 
-def _load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    """한글 폰트 로드 (없으면 기본 폰트 폴백)"""
-    paths = KOREAN_FONT_PATHS if not bold else KOREAN_FONT_PATHS  # 동일 목록 (Bold 우선 포함)
-    for path in paths:
+def _load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    for path in KOREAN_FONT_PATHS:
         try:
             return ImageFont.truetype(path, size)
         except (OSError, IOError):
             continue
-    # 최후 폴백: Pillow 내장 폰트 (한글 미지원)
-    logger.debug(f"한글 폰트 없음 → 기본 폰트 사용 (size={size})")
     return ImageFont.load_default()
 
 
-# ── 그라디언트 배경 ───────────────────────────────────────
+# ── 배경 이미지 다운로드 ──────────────────────────────────
 
-def _make_gradient(width: int, height: int, top_color: tuple, bottom_color: tuple) -> Image.Image:
-    """세로 선형 그라디언트 이미지 생성"""
-    base = Image.new("RGB", (width, height))
-    draw = ImageDraw.Draw(base)
-    for y in range(height):
-        ratio = y / height
-        r = int(top_color[0] + (bottom_color[0] - top_color[0]) * ratio)
-        g = int(top_color[1] + (bottom_color[1] - top_color[1]) * ratio)
-        b = int(top_color[2] + (bottom_color[2] - top_color[2]) * ratio)
-        draw.line([(0, y), (width, y)], fill=(r, g, b))
-    return base
+def _download_bg_image(url: str) -> Optional[Image.Image]:
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp.raise_for_status()
+        img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        return img
+    except Exception as e:
+        logger.debug(f"배경 이미지 다운로드 실패: {e}")
+    return None
 
 
-# ── 장식 요소 ─────────────────────────────────────────────
+def _make_bg_with_image(bg_img: Image.Image, palette: dict) -> Image.Image:
+    """기사 이미지를 배경으로 사용 (블러 + 다크 오버레이)"""
+    # 정사각형으로 크롭
+    w, h = bg_img.size
+    side = min(w, h)
+    left = (w - side) // 2
+    top = (h - side) // 2
+    bg_img = bg_img.crop((left, top, left + side, top + side))
 
-def _draw_decorations(draw: ImageDraw.ImageDraw, palette: dict, width: int, height: int) -> None:
-    """배경 장식 도형 그리기"""
+    bg = bg_img.resize((W, H), Image.LANCZOS)
+    bg = bg.filter(ImageFilter.GaussianBlur(radius=4))
+
+    # 다크 오버레이
+    overlay = Image.new("RGBA", (W, H), (*palette["bg"], palette["overlay_opacity"]))
+    bg = bg.convert("RGBA")
+    bg = Image.alpha_composite(bg, overlay)
+    return bg.convert("RGB")
+
+
+def _make_plain_bg(palette: dict) -> Image.Image:
+    """단색 + 그라디언트 배경 (이미지 없을 때)"""
+    bg_color = palette["bg"]
     accent = palette["accent"]
+    img = Image.new("RGB", (W, H), bg_color)
 
-    # 우상단 큰 원
-    draw.ellipse(
-        [width - 280, -120, width + 80, 240],
-        fill=(*accent, 40),
-        outline=(*accent, 60),
-        width=3,
-    )
-    # 좌하단 원
-    draw.ellipse(
-        [-100, height - 320, 220, height + 60],
-        fill=(*accent, 30),
-        outline=(*accent, 50),
-        width=2,
-    )
-    # 중앙 우측 작은 원
-    draw.ellipse(
-        [width - 120, height // 2 - 60, width - 20, height // 2 + 40],
-        fill=(*accent, 50),
-    )
-    # 상단 수평 구분선
-    draw.line(
-        [(60, 200), (width - 60, 200)],
-        fill=(*accent, 80),
-        width=2,
-    )
+    # 대각선 그라디언트 효과
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
 
+    # 상단 좌측 원형 glow
+    for r in range(400, 0, -20):
+        alpha = int((400 - r) / 400 * 60)
+        draw.ellipse([-r // 2, -r // 2, r, r], fill=(*accent, alpha))
 
-# ── 둥근 사각형 ───────────────────────────────────────────
+    # 하단 우측 원형 glow
+    for r in range(300, 0, -20):
+        alpha = int((300 - r) / 300 * 40)
+        draw.ellipse([W - r // 2, H - r, W + r // 2, H + r // 2], fill=(*accent, alpha))
 
-def _rounded_rect(draw: ImageDraw.ImageDraw, xy: tuple, radius: int, fill: tuple) -> None:
-    """모서리가 둥근 사각형 그리기"""
-    x1, y1, x2, y2 = xy
-    draw.rounded_rectangle([x1, y1, x2, y2], radius=radius, fill=fill)
+    img = Image.alpha_composite(img.convert("RGBA"), overlay)
+    return img.convert("RGB")
 
 
 # ── 텍스트 렌더링 헬퍼 ────────────────────────────────────
 
-def _draw_multiline(
+def _draw_text_wrapped(
     draw: ImageDraw.ImageDraw,
     text: str,
     font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
-    x: int,
-    y: int,
+    x: int, y: int,
     color: tuple,
     max_width: int,
-    line_spacing: int = 8,
+    line_gap: int = 8,
 ) -> int:
-    """최대 너비에 맞게 줄바꿈 후 텍스트 그리기. 다음 y 좌표 반환."""
-    # 한 줄 너비 추정 (한글 1글자 ≈ font_size px)
+    """줄바꿈 텍스트 그리기, 다음 y 반환"""
     try:
         char_w = draw.textlength("가", font=font)
     except Exception:
-        char_w = 20
-    chars_per_line = max(1, int(max_width / char_w))
-    lines = textwrap.wrap(text, width=chars_per_line) or [text]
+        char_w = font.size * 0.9 if hasattr(font, "size") else 20
+    chars = max(1, int(max_width / char_w))
+    lines = textwrap.wrap(text, width=chars) or [text]
 
     for line in lines:
         draw.text((x, y), line, font=font, fill=color)
         try:
-            bbox = draw.textbbox((x, y), line, font=font)
-            line_h = bbox[3] - bbox[1]
+            bb = draw.textbbox((x, y), line, font=font)
+            y += (bb[3] - bb[1]) + line_gap
         except Exception:
-            line_h = 30
-        y += line_h + line_spacing
+            y += (font.size if hasattr(font, "size") else 30) + line_gap
     return y
 
 
-# ── 메인 이미지 생성 ──────────────────────────────────────
+def _draw_rounded_rect(draw: ImageDraw.ImageDraw, xy: tuple, radius: int, fill: tuple) -> None:
+    draw.rounded_rectangle(list(xy), radius=radius, fill=fill)
 
-def generate_image(content: CardContent) -> Path:
-    """
-    CardContent로부터 9:16 카드뉴스 이미지를 생성하고 파일 경로를 반환.
-    """
-    palette = COLOR_PALETTES.get(content.category, COLOR_PALETTES["기본"])
-    W, H = IMAGE_WIDTH, IMAGE_HEIGHT
 
-    # ── 1. 그라디언트 배경 ────────────────────────────────
-    img = _make_gradient(W, H, palette["gradient_top"], palette["gradient_bottom"])
+# ── 슬라이드 렌더링 ───────────────────────────────────────
 
-    # RGBA 변환 (투명도 처리용)
-    img = img.convert("RGBA")
-    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    draw_overlay = ImageDraw.Draw(overlay)
-
-    # ── 2. 장식 요소 ──────────────────────────────────────
-    _draw_decorations(draw_overlay, palette, W, H)
-
-    img = Image.alpha_composite(img, overlay)
+def _render_cover(bg: Image.Image, slide: CardSlide, palette: dict, slide_idx: int, total: int) -> Image.Image:
+    """커버 카드 (배경 이미지 + 하단 텍스트 오버레이)"""
+    img = bg.copy().convert("RGBA")
     draw = ImageDraw.Draw(img)
 
-    # ── 3. 폰트 세트 ──────────────────────────────────────
-    font_emoji    = _load_font(90)
-    font_title    = _load_font(62, bold=True)
-    font_subtitle = _load_font(36)
-    font_bullet   = _load_font(34)
-    font_cta      = _load_font(32)
-    font_hashtag  = _load_font(26)
-    font_number   = _load_font(28, bold=True)
+    accent = palette["accent"]
+    white = (255, 255, 255, 255)
 
-    MARGIN = 70
-    CARD_X1, CARD_X2 = MARGIN, W - MARGIN
-    card_text_w = CARD_X2 - CARD_X1 - 60  # 카드 내부 여백 제외
+    f_label = _load_font(28)
+    f_headline = _load_font(64)
+    f_sub = _load_font(34)
+    f_page = _load_font(26)
 
-    # ── 4. 상단 이모지 & 카테고리 태그 ───────────────────
-    y = 90
-    draw.text((MARGIN, y), content.emoji_accent, font=font_emoji,
-              fill=(*palette["card_bg"][:3], 230))
-
-    cat_tag = f"  {content.category}  "
-    cat_bg = (*palette["accent"], 200)
-    try:
-        tag_bbox = draw.textbbox((0, 0), cat_tag, font=font_subtitle)
-        tag_w = tag_bbox[2] - tag_bbox[0] + 20
-        tag_h = tag_bbox[3] - tag_bbox[1] + 14
-    except Exception:
-        tag_w, tag_h = 120, 40
-    _rounded_rect(draw, (W - MARGIN - tag_w, y + 10, W - MARGIN, y + 10 + tag_h),
-                  radius=12, fill=cat_bg)
-    draw.text((W - MARGIN - tag_w + 10, y + 17), cat_tag,
-              font=font_subtitle, fill=(255, 255, 255, 240))
-
-    y = 220
-
-    # ── 5. 메인 카드 (흰색 반투명 패널) ──────────────────
-    card_top = y
-    card_bottom = H - 220
-    card_fill = palette["card_bg"]  # (R, G, B, A)
-    card_img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    card_draw = ImageDraw.Draw(card_img)
-    card_draw.rounded_rectangle(
-        [CARD_X1, card_top, CARD_X2, card_bottom],
-        radius=30, fill=card_fill,
-    )
-    img = Image.alpha_composite(img, card_img)
+    # 하단 텍스트 영역 그라디언트
+    text_band = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    band_draw = ImageDraw.Draw(text_band)
+    for i in range(400):
+        alpha = int((i / 400) * 200)
+        band_draw.line([(0, H - 400 + i), (W, H - 400 + i)], fill=(0, 0, 0, alpha))
+    img = Image.alpha_composite(img, text_band)
     draw = ImageDraw.Draw(img)
 
-    # ── 6. 제목 ───────────────────────────────────────────
-    y = card_top + 50
-    y = _draw_multiline(
-        draw, content.title, font_title,
-        CARD_X1 + 40, y,
-        color=(*palette["title_color"], 255),
-        max_width=card_text_w,
-        line_spacing=10,
-    )
-    y += 10
+    # 상단 레이블 배지
+    if slide.label:
+        label_bg = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        lb_draw = ImageDraw.Draw(label_bg)
+        try:
+            tw = draw.textlength(slide.label, font=f_label)
+        except Exception:
+            tw = len(slide.label) * 16
+        pad_x, pad_y = 20, 10
+        bx = MARGIN
+        by = MARGIN
+        lb_draw.rounded_rectangle(
+            [bx, by, bx + tw + pad_x * 2, by + 40 + pad_y],
+            radius=8,
+            fill=(*accent, 220),
+        )
+        img = Image.alpha_composite(img, label_bg)
+        draw = ImageDraw.Draw(img)
+        draw.text((bx + pad_x, by + pad_y // 2), slide.label, font=f_label, fill=white)
 
-    # 제목 하단 강조선
-    draw.line([(CARD_X1 + 40, y), (CARD_X1 + 40 + 80, y)],
-              fill=(*palette["accent"], 200), width=4)
+    # 헤드라인
+    y = H - 320
+    y = _draw_text_wrapped(draw, slide.headline, f_headline, MARGIN, y, white, INNER_W, line_gap=12)
+
+    # 서브헤드라인
+    if slide.subheadline:
+        y += 10
+        _draw_text_wrapped(draw, slide.subheadline, f_sub, MARGIN, y, (200, 200, 200, 220), INNER_W)
+
+    # 페이지 표시
+    if total > 1:
+        page_text = f"{slide_idx + 1} / {total}"
+        draw.text((W - MARGIN - 60, MARGIN + 5), page_text, font=f_page, fill=(180, 180, 180, 200))
+
+    # 하단 액센트 라인
+    draw.line([(MARGIN, H - 60), (W - MARGIN, H - 60)], fill=(*accent, 120), width=2)
+
+    return img.convert("RGB")
+
+
+def _render_bullets(bg: Image.Image, slide: CardSlide, palette: dict, slide_idx: int, total: int) -> Image.Image:
+    """불릿 카드 (어두운 배경 + 번호 배지 불릿)"""
+    # 어두운 반투명 패널 오버레이
+    dark = Image.new("RGBA", (W, H), (0, 0, 0, 200))
+    img = Image.alpha_composite(bg.convert("RGBA"), dark)
+
+    # 패널 카드
+    panel = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    p_draw = ImageDraw.Draw(panel)
+    p_draw.rounded_rectangle(
+        [MARGIN, 120, W - MARGIN, H - 100],
+        radius=24,
+        fill=(*palette["bg"], 220),
+    )
+    img = Image.alpha_composite(img, panel)
+    draw = ImageDraw.Draw(img)
+
+    accent = palette["accent"]
+    white = (255, 255, 255, 255)
+    text_c = (*palette["text_color"], 235)
+
+    f_label = _load_font(26)
+    f_headline = _load_font(52)
+    f_bullet = _load_font(34)
+    f_page = _load_font(26)
+
+    # 레이블
+    y = 160
+    if slide.label:
+        draw.text((MARGIN + 30, y), slide.label, font=f_label, fill=(*accent, 220))
+        y += 44
+
+    # 액센트 라인
+    draw.line([(MARGIN + 30, y), (MARGIN + 30 + 60, y)], fill=(*accent, 200), width=4)
     y += 20
 
-    # ── 7. 부제목 ─────────────────────────────────────────
-    y = _draw_multiline(
-        draw, content.subtitle, font_subtitle,
-        CARD_X1 + 40, y,
-        color=(*palette["text_color"], 180),
-        max_width=card_text_w,
-        line_spacing=6,
-    )
+    # 헤드라인
+    y = _draw_text_wrapped(draw, slide.headline, f_headline, MARGIN + 30, y, white, INNER_W - 30, line_gap=10)
     y += 30
 
-    # ── 8. 불릿 포인트 ────────────────────────────────────
-    for i, bullet in enumerate(content.bullets, start=1):
-        # 번호 배지
-        badge_size = 34
-        badge_x = CARD_X1 + 35
-        draw.ellipse(
-            [badge_x, y, badge_x + badge_size, y + badge_size],
-            fill=(*palette["accent"], 220),
+    # 불릿 포인트
+    for i, bullet in enumerate(slide.bullets[:4], start=1):
+        badge_r = 22
+        bx, by = MARGIN + 30, y
+        draw.ellipse([bx, by, bx + badge_r * 2, by + badge_r * 2], fill=(*accent, 230))
+        draw.text((bx + badge_r, by + badge_r), str(i), font=_load_font(22), fill=white, anchor="mm")
+        next_y = _draw_text_wrapped(
+            draw, bullet, f_bullet,
+            bx + badge_r * 2 + 16, by + 4,
+            text_c, INNER_W - badge_r * 2 - 20,
+            line_gap=6,
         )
-        draw.text(
-            (badge_x + badge_size // 2, y + badge_size // 2),
-            str(i), font=font_number,
-            fill=(255, 255, 255, 255),
-            anchor="mm",
-        )
-        # 불릿 텍스트
-        y = _draw_multiline(
-            draw, bullet, font_bullet,
-            badge_x + badge_size + 14, y + 2,
-            color=(*palette["text_color"], 230),
-            max_width=card_text_w - badge_size - 20,
-            line_spacing=5,
-        )
-        y += 16
+        y = max(next_y, by + badge_r * 2) + 20
 
-    # ── 9. CTA ────────────────────────────────────────────
-    y = max(y + 20, card_bottom - 160)
-    cta_bg_img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    cta_draw = ImageDraw.Draw(cta_bg_img)
-    cta_draw.rounded_rectangle(
-        [CARD_X1 + 30, y, CARD_X2 - 30, y + 60],
-        radius=14, fill=(*palette["accent"], 50),
+    # 서브헤드라인 (있으면)
+    if slide.subheadline:
+        draw.text((MARGIN + 30, y + 10), slide.subheadline, font=f_label, fill=(*accent, 180))
+
+    # 페이지 표시
+    if total > 1:
+        draw.text((W - MARGIN - 70, H - 70), f"{slide_idx + 1} / {total}", font=f_page, fill=(160, 160, 160, 200))
+
+    return img.convert("RGB")
+
+
+def _render_cta(bg: Image.Image, slide: CardSlide, palette: dict, slide_idx: int, total: int) -> Image.Image:
+    """CTA 카드 (중앙 정렬 메시지)"""
+    dark = Image.new("RGBA", (W, H), (0, 0, 0, 180))
+    img = Image.alpha_composite(bg.convert("RGBA"), dark)
+
+    panel = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    p_draw = ImageDraw.Draw(panel)
+    p_draw.rounded_rectangle(
+        [MARGIN, H // 3, W - MARGIN, H * 2 // 3 + 60],
+        radius=24,
+        fill=(*palette["bg"], 230),
     )
-    img = Image.alpha_composite(img, cta_bg_img)
+    img = Image.alpha_composite(img, panel)
     draw = ImageDraw.Draw(img)
-    draw.text(
-        ((CARD_X1 + CARD_X2) // 2, y + 30),
-        content.cta, font=font_cta,
-        fill=(*palette["title_color"], 240),
-        anchor="mm",
-    )
 
-    # ── 10. 하단 해시태그 영역 ────────────────────────────
-    hashtag_y = card_bottom + 30
-    hashtag_text = "  ".join(content.hashtags[:8])
-    _draw_multiline(
-        draw, hashtag_text, font_hashtag,
-        MARGIN, hashtag_y,
-        color=(255, 255, 255, 180),
-        max_width=W - MARGIN * 2,
-        line_spacing=6,
-    )
+    accent = palette["accent"]
+    white = (255, 255, 255, 255)
 
-    # ── 11. 저장 ──────────────────────────────────────────
-    img_rgb = img.convert("RGB")
+    f_label = _load_font(28)
+    f_headline = _load_font(54)
+    f_sub = _load_font(32)
+
+    # 레이블
+    if slide.label:
+        try:
+            tw = draw.textlength(slide.label, font=f_label)
+        except Exception:
+            tw = len(slide.label) * 15
+        lx = (W - tw) // 2
+        draw.text((lx, H // 3 + 40), slide.label, font=f_label, fill=(*accent, 220))
+
+    # 헤드라인 (중앙)
+    hy = H // 3 + 100
+    for line in textwrap.wrap(slide.headline, width=14):
+        try:
+            tw = draw.textlength(line, font=f_headline)
+        except Exception:
+            tw = len(line) * 30
+        draw.text(((W - tw) // 2, hy), line, font=f_headline, fill=white)
+        try:
+            bb = draw.textbbox(((W - tw) // 2, hy), line, font=f_headline)
+            hy += (bb[3] - bb[1]) + 12
+        except Exception:
+            hy += 60
+
+    # 서브헤드라인
+    if slide.subheadline:
+        try:
+            tw = draw.textlength(slide.subheadline, font=f_sub)
+        except Exception:
+            tw = len(slide.subheadline) * 17
+        draw.text(((W - tw) // 2, hy + 20), slide.subheadline, font=f_sub, fill=(200, 200, 200, 200))
+
+    # 하단 계정명
+    f_acct = _load_font(26)
+    acct = "@space.go__"
+    try:
+        tw = draw.textlength(acct, font=f_acct)
+    except Exception:
+        tw = 180
+    draw.text(((W - tw) // 2, H - 80), acct, font=f_acct, fill=(*accent, 180))
+
+    if total > 1:
+        draw.text((W - MARGIN - 70, H - 80), f"{slide_idx + 1} / {total}", font=f_label, fill=(160, 160, 160, 200))
+
+    return img.convert("RGB")
+
+
+def _render_slide(bg: Image.Image, slide: CardSlide, palette: dict, idx: int, total: int) -> Image.Image:
+    if slide.slide_type == "cover":
+        return _render_cover(bg, slide, palette, idx, total)
+    elif slide.slide_type == "cta":
+        return _render_cta(bg, slide, palette, idx, total)
+    else:  # bullets / detail
+        return _render_bullets(bg, slide, palette, idx, total)
+
+
+# ── 공개 인터페이스 ───────────────────────────────────────
+
+def generate_card_images(content: CardContent) -> list[Path]:
+    """
+    CardContent → 슬라이드 이미지 파일 목록 반환 (1~4장)
+    """
+    palette = COLOR_PALETTES.get(content.category, COLOR_PALETTES["기본"])
+
+    # 배경 이미지 준비
+    bg: Optional[Image.Image] = None
+    if content.image_url:
+        bg = _download_bg_image(content.image_url)
+        if bg:
+            bg = _make_bg_with_image(bg, palette)
+    if bg is None:
+        bg = _make_plain_bg(palette)
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_kw = "".join(c for c in content.keyword if c.isalnum() or c in "가-힣")[:20]
-    filename = f"card_{safe_kw}_{timestamp}.jpg"
-    output_path = OUTPUT_DIR / filename
-    img_rgb.save(output_path, "JPEG", quality=IMAGE_QUALITY, optimize=True)
+    safe_title = re.sub(r"[^\w가-힣]", "", content.article_title)[:20]
+    total = len(content.slides)
 
-    logger.info(f"이미지 생성 완료: {output_path}")
-    return output_path
+    paths: list[Path] = []
+    for i, slide in enumerate(content.slides):
+        rendered = _render_slide(bg, slide, palette, i, total)
+        filename = f"card_{safe_title}_{timestamp}_{i + 1}of{total}.png"
+        out_path = OUTPUT_DIR / filename
+        rendered.save(out_path, "PNG", optimize=True)
+        logger.info(f"슬라이드 저장: {out_path.name}")
+        paths.append(out_path)
+
+    return paths

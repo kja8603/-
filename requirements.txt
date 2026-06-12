@@ -3,11 +3,17 @@
 # 이미지 생성
 Pillow>=10.0.0
 
-# 트렌드 수집
-pytrends>=4.9.2
+# 뉴스 수집 (feedparser는 Python 3.11+ 비호환으로 제외)
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
 
 # 환경변수
 python-dotenv>=1.0.0
+
+# 스케줄러 (타임존 지원)
+APScheduler>=3.10.0
+pytz>=2024.1
+
+# Claude API (선택 - ANTHROPIC_API_KEY 설정 시 자동 사용)
+anthropic>=0.40.0

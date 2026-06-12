@@ -1,290 +1,280 @@
-# content_generator.py - 트렌드 기반 카드뉴스 콘텐츠 생성
+# content_generator.py - 뉴스 기사 기반 카드뉴스 콘텐츠 생성
 
+import json
+import logging
+import os
 import random
 import re
 from dataclasses import dataclass, field
+from typing import Optional
 
-from trend_collector import TrendItem
-from config import BASE_HASHTAGS, CATEGORY_KEYWORDS
+from news_collector import NewsArticle
+from config import (
+    COLOR_PALETTES, CATEGORY_HASHTAGS, BASE_HASHTAGS,
+    CARDS_RANGE, ANTHROPIC_API_KEY,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CardSlide:
+    slide_type: str          # "cover" | "bullets" | "detail" | "cta"
+    headline: str            # 메인 텍스트
+    subheadline: str = ""    # 서브 텍스트
+    bullets: list[str] = field(default_factory=list)
+    label: str = ""          # 상단 레이블 (예: "스포츠 | 오늘의 이슈")
 
 
 @dataclass
 class CardContent:
-    keyword: str
     category: str
-    title: str
-    subtitle: str
-    bullets: list[str]          # 본문 포인트 (4~6개)
-    cta: str                    # Call to Action
+    article_title: str
+    slides: list[CardSlide]    # 1~4장
+    caption: str               # Instagram 캡션 (요약 + 해시태그)
     hashtags: list[str]
-    emoji_accent: str           # 카드 상단 이모지
+    image_url: Optional[str]   # 배경 이미지 URL
 
 
-# ── 카테고리별 템플릿 ─────────────────────────────────────
+# ── Claude API 기반 콘텐츠 생성 ───────────────────────────
 
-TEMPLATES = {
-    "뷰티": {
-        "emojis": ["✨", "💄", "🌸", "💅", "🪞"],
-        "title_formats": [
-            "요즘 난리난 {kw} 완전 정복",
-            "{kw} 트렌드, 이것만 알면 돼",
-            "올봄 필수템! {kw} 추천",
-            "{kw} 제대로 하는 법",
-        ],
-        "subtitles": [
-            "SNS를 뒤흔든 뷰티 트렌드 총정리",
-            "뷰티 덕후들이 선택한 꿀템 리스트",
-            "지금 당장 따라 해야 할 뷰티 루틴",
-        ],
-        "bullet_templates": [
-            "피부 타입별 맞춤 {kw} 방법",
-            "가성비 끝판왕 {kw} 추천 아이템",
-            "SNS에서 난리난 {kw} 활용법",
-            "전문가가 알려주는 {kw} 꿀팁",
-            "계절별 {kw} 루틴 변경 포인트",
-            "{kw} 할 때 절대 하지 말아야 할 것",
-        ],
-        "ctas": [
-            "저장하고 나중에 따라 해봐요!",
-            "좋아요와 팔로우로 응원해주세요 💕",
-            "댓글로 여러분의 {kw} 팁도 공유해요!",
-        ],
-        "hashtag_extras": ["#뷰티", "#메이크업", "#스킨케어", "#뷰티팁", "#화장법"],
-    },
-    "패션": {
-        "emojis": ["👗", "🛍️", "💜", "✨", "🖤"],
-        "title_formats": [
-            "{kw} 스타일링 완벽 가이드",
-            "지금 당장 도전! {kw} 코디법",
-            "{kw}으로 완성하는 데일리룩",
-            "패피들의 선택, {kw} 트렌드",
-        ],
-        "subtitles": [
-            "이번 시즌 꼭 알아야 할 패션 키워드",
-            "스타일리스트가 픽한 무조건 예쁜 조합",
-            "트렌디하게 입고 싶다면 여기 주목",
-        ],
-        "bullet_templates": [
-            "{kw} 아이템 베스트 5 추천",
-            "체형별 {kw} 스타일링 꿀팁",
-            "예산별 {kw} 쇼핑 리스트",
-            "연령대별 {kw} 코디 제안",
-            "{kw} 컬러 매칭 가이드",
-            "오피스룩부터 캐주얼까지 {kw} 활용",
-        ],
-        "ctas": [
-            "팔로우하고 매일 스타일 업데이트 받아요!",
-            "어떤 스타일이 제일 예뻐요? 댓글로!",
-            "저장해두고 쇼핑할 때 참고하세요 🛍️",
-        ],
-        "hashtag_extras": ["#패션", "#오오티디", "#코디", "#스타일", "#패션피플"],
-    },
-    "음식": {
-        "emojis": ["🍽️", "😋", "🔥", "🍜", "☕"],
-        "title_formats": [
-            "{kw} 맛집 & 레시피 총정리",
-            "요즘 핫한 {kw} 완벽 가이드",
-            "집에서 만드는 {kw} 레시피",
-            "{kw} 먹방 리뷰 & 추천",
-        ],
-        "subtitles": [
-            "지금 SNS에서 가장 많이 먹는 음식",
-            "미식가들이 인정한 맛집 & 레시피",
-            "한 번만 먹으면 중독되는 그 맛",
-        ],
-        "bullet_templates": [
-            "{kw} 맛집 베스트 추천 리스트",
-            "{kw} 레시피 재료 & 만드는 법",
-            "{kw} 칼로리 & 영양 정보",
-            "{kw} 관련 인스타 핫플 소개",
-            "{kw} 배달 꿀팁 & 주문법",
-            "{kw}와 어울리는 음료 페어링",
-        ],
-        "ctas": [
-            "드셔보셨나요? 댓글로 후기 남겨요!",
-            "저장하고 주말에 도전해보세요 😋",
-            "팔로우하면 매일 맛집 정보 드려요!",
-        ],
-        "hashtag_extras": ["#맛집", "#음식", "#먹스타그램", "#레시피", "#맛스타그램"],
-    },
-    "여행": {
-        "emojis": ["✈️", "🗺️", "🌊", "🏔️", "📸"],
-        "title_formats": [
-            "{kw} 완벽 여행 가이드",
-            "지금 당장 떠나고 싶은 {kw}",
-            "{kw} 여행 꿀팁 총정리",
-            "{kw}에서 꼭 해야 할 것들",
-        ],
-        "subtitles": [
-            "이번 연휴 여기 어때요?",
-            "여행 고수들만 아는 숨은 명소",
-            "인생샷 건지는 여행지 추천",
-        ],
-        "bullet_templates": [
-            "{kw} 추천 여행 코스 & 일정",
-            "{kw} 숙소 선택 꿀팁",
-            "{kw}에서 먹어야 할 현지 음식",
-            "{kw} 교통편 & 이동 방법",
-            "{kw} 여행 예산 계획 가이드",
-            "{kw} 인생샷 포토스팟 리스트",
-        ],
-        "ctas": [
-            "다음 여행지로 저장해두세요 ✈️",
-            "가보셨나요? 후기 댓글로 공유해요!",
-            "팔로우하고 여행 정보 계속 받아가요!",
-        ],
-        "hashtag_extras": ["#여행", "#국내여행", "#여행스타그램", "#여행꿀팁", "#여행지추천"],
-    },
-    "라이프스타일": {
-        "emojis": ["🌿", "💚", "🏠", "📚", "🧘"],
-        "title_formats": [
-            "{kw} 완전 정복 가이드",
-            "삶의 질이 올라가는 {kw} 루틴",
-            "{kw}으로 바꾸는 일상",
-            "요즘 핫한 {kw} 트렌드",
-        ],
-        "subtitles": [
-            "작은 변화가 만드는 큰 차이",
-            "삶의 질을 높이는 라이프스타일 팁",
-            "지금 당장 실천할 수 있는 꿀팁",
-        ],
-        "bullet_templates": [
-            "{kw} 시작하는 방법 단계별 안내",
-            "{kw} 관련 추천 아이템 & 도구",
-            "{kw} 효과 극대화 꿀팁",
-            "초보자를 위한 {kw} 입문 가이드",
-            "{kw} 꾸준히 하는 동기부여 방법",
-            "{kw}와 함께하는 하루 루틴 설계",
-        ],
-        "ctas": [
-            "오늘부터 시작해봐요! 응원할게요 💚",
-            "저장하고 오늘 바로 실천해보세요!",
-            "여러분의 {kw} 팁도 댓글로 공유해요!",
-        ],
-        "hashtag_extras": ["#라이프스타일", "#일상", "#자기계발", "#힐링", "#루틴"],
-    },
-    "기술": {
-        "emojis": ["🤖", "💡", "📱", "⚡", "🔬"],
-        "title_formats": [
-            "{kw} 완벽 활용 가이드",
-            "몰랐으면 손해! {kw} 꿀팁",
-            "{kw} 제대로 쓰는 법",
-            "지금 당장 써봐야 할 {kw}",
-        ],
-        "subtitles": [
-            "테크 트렌드 한눈에 정리",
-            "일상을 바꾸는 기술 활용법",
-            "생산성 10배 높이는 디지털 꿀팁",
-        ],
-        "bullet_templates": [
-            "{kw} 주요 기능 & 장점 소개",
-            "{kw} 초보자 시작 가이드",
-            "{kw} 활용 실전 꿀팁 모음",
-            "{kw} 관련 무료 도구 & 앱 추천",
-            "{kw} 보안 & 개인정보 주의사항",
-            "{kw} 최신 업데이트 & 변경사항",
-        ],
-        "ctas": [
-            "팔로우하고 최신 기술 트렌드 받아요 🤖",
-            "써봤나요? 후기 댓글로 알려주세요!",
-            "저장하고 나중에 천천히 읽어보세요!",
-        ],
-        "hashtag_extras": ["#테크", "#AI", "#디지털", "#앱추천", "#기술트렌드"],
-    },
-    "기본": {
-        "emojis": ["⭐", "💫", "🔥", "✨", "💯"],
-        "title_formats": [
-            "{kw} 완벽 정리",
-            "알면 유용한 {kw} 가이드",
-            "{kw} 트렌드 총정리",
-            "{kw} 이것만 알면 OK",
-        ],
-        "subtitles": [
-            "지금 가장 핫한 트렌드 정보",
-            "알아두면 쓸모있는 꿀팁 모음",
-            "SNS에서 가장 많이 본 그것",
-        ],
-        "bullet_templates": [
-            "{kw} 기본 정보 & 개요",
-            "{kw} 활용 방법 & 꿀팁",
-            "{kw} 추천 & 비교 가이드",
-            "{kw} 주의사항 & 알아야 할 것",
-            "{kw} 관련 최신 트렌드",
-            "{kw} 전문가 추천 포인트",
-        ],
-        "ctas": [
-            "저장하고 나중에 참고하세요!",
-            "도움이 됐다면 좋아요 눌러주세요!",
-            "팔로우하고 다음 콘텐츠도 받아가요!",
-        ],
-        "hashtag_extras": ["#꿀팁", "#정보공유", "#트렌드", "#추천"],
-    },
+def _generate_with_claude(article: NewsArticle, num_cards: int) -> Optional[dict]:
+    """Claude API로 카드뉴스 JSON 생성"""
+    if not ANTHROPIC_API_KEY:
+        return None
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+        text_input = article.body or article.summary
+        prompt = f"""당신은 한국 인스타그램 카드뉴스 작성 전문가입니다.
+아래 뉴스 기사를 바탕으로 {num_cards}장짜리 카드뉴스 콘텐츠를 JSON으로 생성하세요.
+
+카테고리: {article.category}
+제목: {article.title}
+내용: {text_input[:800]}
+
+규칙:
+- 모든 텍스트는 반드시 한국어
+- 헤드라인은 임팩트 있게 20자 이내
+- 불릿은 핵심만, 한 줄 30자 이내
+- 캡션은 2~3문장 자연스러운 요약
+
+반드시 아래 JSON 형식만 반환하세요:
+{{
+  "slides": [
+    {{
+      "slide_type": "cover",
+      "headline": "강렬한 헤드라인",
+      "subheadline": "부제목 (15자 이내)",
+      "label": "{article.category} | 오늘의 이슈"
+    }}{"," if num_cards > 1 else ""}
+    {', '.join(['''{{
+      "slide_type": "bullets",
+      "headline": "핵심 포인트",
+      "bullets": ["포인트 1", "포인트 2", "포인트 3"],
+      "label": "주요 내용"
+    }}''' for _ in range(min(num_cards - 1, 2))])}{"," if num_cards >= 4 else ""}
+    {'''{{
+      "slide_type": "cta",
+      "headline": "한 줄 핵심 메시지",
+      "subheadline": "여러분의 생각은?",
+      "label": "오늘의 한마디"
+    }}''' if num_cards >= 4 else ""}
+  ],
+  "caption": "인스타그램 캡션 요약 2~3문장",
+  "hashtags": ["#해시태그1", "#해시태그2", "#해시태그3", "#해시태그4", "#해시태그5"]
+}}"""
+
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = msg.content[0].text.strip()
+        # JSON 블록 추출
+        match = re.search(r"\{[\s\S]+\}", raw)
+        if match:
+            return json.loads(match.group())
+    except Exception as e:
+        logger.warning(f"Claude API 콘텐츠 생성 실패: {e}")
+    return None
+
+
+# ── 템플릿 기반 폴백 콘텐츠 생성 ─────────────────────────
+
+COVER_TEMPLATES = {
+    "연예": [
+        "{title}",
+        "지금 연예계 핫이슈",
+        "오늘 터진 연예 뉴스",
+    ],
+    "한국 사회": [
+        "오늘 한국 사회 이슈",
+        "지금 한국에서 일어난 일",
+        "놓치면 안 될 사회 이슈",
+    ],
+    "스포츠": [
+        "오늘의 스포츠 소식",
+        "핫한 스포츠 이슈",
+        "스포츠 오늘의 하이라이트",
+    ],
+    "주요 세계 이슈": [
+        "세계가 주목하는 지금",
+        "오늘의 세계 이슈",
+        "글로벌 핫 이슈",
+    ],
+    "기본": [
+        "오늘의 주요 이슈",
+        "지금 뜨는 뉴스",
+        "놓치면 아쉬운 오늘의 소식",
+    ],
 }
 
 
-def _fill(template: str, kw: str) -> str:
-    """템플릿의 {kw} 플레이스홀더 치환"""
-    return template.replace("{kw}", kw)
+def _split_into_bullets(text: str, count: int = 3) -> list[str]:
+    """텍스트를 문장 단위로 분리하여 불릿 생성"""
+    sentences = re.split(r"[.。!?]\s+", text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+    if not sentences:
+        return [text[:60]]
+
+    result = []
+    for s in sentences[:count]:
+        line = s[:50] + ("…" if len(s) > 50 else "")
+        result.append(line)
+    while len(result) < count and result:
+        result.append(result[-1])
+    return result[:count]
 
 
-def generate_hashtags(keyword: str, category: str, count: int = 15) -> list[str]:
-    """키워드 + 카테고리 기반 해시태그 생성"""
+def _generate_template_content(article: NewsArticle, num_cards: int) -> dict:
+    """템플릿 기반 콘텐츠 생성 (API 폴백)"""
+    cat = article.category
+    tmpl_covers = COVER_TEMPLATES.get(cat, COVER_TEMPLATES["기본"])
+
+    slides = []
+
+    # 카드 1: 커버
+    slides.append({
+        "slide_type": "cover",
+        "headline": article.title[:40] + ("…" if len(article.title) > 40 else ""),
+        "subheadline": random.choice(tmpl_covers),
+        "label": f"{cat} | 오늘의 이슈",
+        "bullets": [],
+    })
+
+    # 카드 2: 불릿 요약
+    if num_cards >= 2:
+        text = article.body or article.summary
+        bullets = _split_into_bullets(text, 3)
+        slides.append({
+            "slide_type": "bullets",
+            "headline": "핵심 내용",
+            "subheadline": "",
+            "label": "주요 내용",
+            "bullets": bullets,
+        })
+
+    # 카드 3: 추가 내용
+    if num_cards >= 3 and len(article.summary) > 150:
+        more_text = (article.body or article.summary)[200:]
+        bullets2 = _split_into_bullets(more_text, 3)
+        slides.append({
+            "slide_type": "detail",
+            "headline": "더 알아보기",
+            "subheadline": "",
+            "label": "상세 내용",
+            "bullets": bullets2,
+        })
+
+    # 카드 4: CTA
+    if num_cards >= 4:
+        slides.append({
+            "slide_type": "cta",
+            "headline": "여러분의 생각은?",
+            "subheadline": "댓글로 의견을 남겨주세요",
+            "label": "오늘의 한마디",
+            "bullets": [],
+        })
+
+    caption = f"{article.title}\n\n{article.summary[:200]}" if article.summary else article.title
+    hashtags = ["#뉴스", "#이슈", f"#{cat}"]
+
+    return {
+        "slides": slides[:num_cards],
+        "caption": caption,
+        "hashtags": hashtags,
+    }
+
+
+# ── 공개 인터페이스 ───────────────────────────────────────
+
+def _determine_num_cards(article: NewsArticle, category: str) -> int:
+    """기사 길이와 카테고리 기반으로 카드 수 결정"""
+    min_c, max_c = CARDS_RANGE.get(category, (1, 4))
+    text_len = len(article.body or article.summary or "")
+
+    if text_len < 100:
+        return min_c
+    elif text_len < 300:
+        return min(min_c + 1, max_c)
+    elif text_len < 600:
+        return min(min_c + 2, max_c)
+    else:
+        return max_c
+
+
+def _build_hashtags(category: str, extra_tags: list[str]) -> list[str]:
     tags = set(BASE_HASHTAGS)
-
-    # 카테고리별 해시태그 추가
-    extras = TEMPLATES.get(category, TEMPLATES["기본"])["hashtag_extras"]
-    tags.update(extras)
-
-    # 키워드 기반 해시태그
-    clean_kw = re.sub(r"[^\w가-힣]", "", keyword)
-    if clean_kw:
-        tags.add(f"#{clean_kw}")
-
-    # 키워드 단어 분리 해시태그
-    words = keyword.split()
-    for w in words:
-        clean_w = re.sub(r"[^\w가-힣]", "", w)
-        if len(clean_w) >= 2:
-            tags.add(f"#{clean_w}")
-
-    # 일반 인기 태그 보충
-    general_tags = [
-        "#오늘의정보", "#인스타그램", "#꿀팁모음", "#유용한정보",
-        "#일상공유", "#소통해요", "#팔로우미", "#좋아요반사",
-    ]
-    tags.update(random.sample(general_tags, min(3, len(general_tags))))
-
-    tag_list = list(tags)[:count]
-    random.shuffle(tag_list)
-    return tag_list
+    tags.update(CATEGORY_HASHTAGS.get(category, []))
+    tags.update(extra_tags)
+    return list(tags)[:20]
 
 
-def generate_card_content(trend: TrendItem) -> CardContent:
-    """TrendItem으로부터 카드뉴스 콘텐츠 생성"""
-    cat = trend.category if trend.category in TEMPLATES else "기본"
-    tmpl = TEMPLATES[cat]
-    kw = trend.keyword
+def generate_card_content(article: NewsArticle) -> CardContent:
+    """NewsArticle → CardContent 생성 (Claude API 우선, 템플릿 폴백)"""
+    cat = article.category
+    num_cards = _determine_num_cards(article, cat)
 
-    title = _fill(random.choice(tmpl["title_formats"]), kw)
-    subtitle = random.choice(tmpl["subtitles"])
-    emoji = random.choice(tmpl["emojis"])
+    # Claude API 시도
+    raw = _generate_with_claude(article, num_cards)
 
-    # 불릿 4~5개 무작위 선택
-    num_bullets = random.randint(4, 5)
-    bullet_pool = tmpl["bullet_templates"]
-    selected = random.sample(bullet_pool, min(num_bullets, len(bullet_pool)))
-    bullets = [_fill(b, kw) for b in selected]
+    # 폴백
+    if not raw:
+        raw = _generate_template_content(article, num_cards)
 
-    cta = _fill(random.choice(tmpl["ctas"]), kw)
-    hashtags = generate_hashtags(kw, cat)
+    # 슬라이드 파싱
+    slides = []
+    for s in raw.get("slides", [])[:num_cards]:
+        slides.append(CardSlide(
+            slide_type=s.get("slide_type", "bullets"),
+            headline=s.get("headline", article.title[:40]),
+            subheadline=s.get("subheadline", ""),
+            bullets=[b for b in s.get("bullets", []) if b],
+            label=s.get("label", cat),
+        ))
+
+    if not slides:
+        slides = [CardSlide(
+            slide_type="cover",
+            headline=article.title[:40],
+            subheadline="",
+            label=cat,
+        )]
+
+    # 캡션 구성
+    caption_body = raw.get("caption", article.summary[:200] or article.title)
+    extra_tags = raw.get("hashtags", [])
+    hashtags = _build_hashtags(cat, extra_tags)
+
+    caption = f"{caption_body}\n\n" + " ".join(hashtags[:15])
 
     return CardContent(
-        keyword=kw,
         category=cat,
-        title=title,
-        subtitle=subtitle,
-        bullets=bullets,
-        cta=cta,
+        article_title=article.title,
+        slides=slides,
+        caption=caption,
         hashtags=hashtags,
-        emoji_accent=emoji,
+        image_url=article.image_url,
     )
