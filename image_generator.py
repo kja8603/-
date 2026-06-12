@@ -12,7 +12,7 @@ import requests
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 from config import (
-    IMAGE_WIDTH, IMAGE_HEIGHT, IMAGE_QUALITY,
+    IMAGE_WIDTH, IMAGE_HEIGHT, IMAGE_FORMAT,
     OUTPUT_DIR, KOREAN_FONT_PATHS, COLOR_PALETTES,
 )
 from content_generator import CardContent, CardSlide
@@ -358,9 +358,9 @@ def generate_card_images(content: CardContent) -> list[Path]:
     paths: list[Path] = []
     for i, slide in enumerate(content.slides):
         rendered = _render_slide(bg, slide, palette, i, total)
-        filename = f"card_{safe_title}_{timestamp}_{i + 1}of{total}.jpg"
+        filename = f"card_{safe_title}_{timestamp}_{i + 1}of{total}.png"
         out_path = OUTPUT_DIR / filename
-        rendered.save(out_path, "JPEG", quality=IMAGE_QUALITY, optimize=True)
+        rendered.save(out_path, "PNG", optimize=True)
         logger.info(f"슬라이드 저장: {out_path.name}")
         paths.append(out_path)
 

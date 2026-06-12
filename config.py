@@ -14,7 +14,7 @@ FONT_DIR.mkdir(exist_ok=True)
 # ── 이미지 설정 (인스타그램 1:1 정사각형) ─────────────────
 IMAGE_WIDTH = 1080
 IMAGE_HEIGHT = 1080
-IMAGE_QUALITY = 95
+IMAGE_FORMAT = "PNG"
 
 # ── 폰트 경로 ─────────────────────────────────────────────
 KOREAN_FONT_PATHS = [

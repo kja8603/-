@@ -39,8 +39,8 @@ def scheduled_job() -> None:
     logger.info(f"{'='*60}")
 
     try:
-        results = run_pipeline(categories=CATEGORIES, dry_run=False)
-        print_summary(results, dry_run=False)
+        results = run_pipeline(categories=CATEGORIES)
+        print_summary(results)
     except Exception as e:
         logger.exception(f"스케줄 실행 오류: {e}")
 
